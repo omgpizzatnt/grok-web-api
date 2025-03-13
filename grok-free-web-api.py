@@ -217,7 +217,100 @@ def openai_to_grok_proxy():
             "fileAttachments": []
         })
 
+    # 检查是否请求流式响应
+    stream_mode = openai_request_data.get('stream', False)
+    
+    # 非流式模式处理函数
+    def process_non_stream_response():
+        try:
+            grok_response = session.post(
+                GROK_API_URL,
+                headers=grok_request_headers,
+                json=grok_request_body,
+                stream=True
+            )
+            grok_response.raise_for_status()
 
+            date_str = grok_response.headers.get('date')
+            if date_str:
+                dt = parsedate_to_datetime(date_str)
+                openai_created_time = int(dt.timestamp())
+            else:
+                openai_created_time = int(time.time())
+
+            grok_id = grok_response.headers.get('userChatItemId') or int(time.time() * 1000)
+            openai_chunk_id = encode_chat_id(grok_id)
+            openai_model = grok_request_body['grokModelOptionId']
+
+            # 累积所有响应
+            full_content = ""
+            print("开始处理Grok API响应...")
+            for line in grok_response.iter_lines():
+                if line:
+                    print(f"接收到行: {line.decode('utf-8')}")
+                    try:
+                        grok_data = json.loads(line.decode('utf-8'))
+                        if 'result' in grok_data and 'sender' in grok_data['result']:
+                            result = grok_data['result']
+                            print(f"发送者ID: {result['sender']}")
+                            
+                            # 修改这一行 - 检查字符串"ASSISTANT"而不是数字2
+                            if result['sender'] == "ASSISTANT" or result['sender'] == 2:  
+                                message_content = convert_tweet_links(result.get('message', ''))
+                                print(f"消息内容: {message_content}")
+                                is_thinking = result.get('isThinking', False)
+                                print(f"是思考内容: {is_thinking}")
+                                if not is_thinking and message_content:  # 确保内容不为空
+                                    full_content += message_content
+                                    print(f"当前累积内容: {full_content}")
+                        else:
+                            print(f"未找到结果或发送者字段: {grok_data}")
+                    except json.JSONDecodeError:
+                        print(f"Warning: Could not decode JSON: {line.decode('utf-8')}")
+                    except Exception as e:
+                        print(f"Error processing Grok response chunk: {e}")
+            
+            print(f"最终累积内容: {full_content}")
+            
+            # 如果内容为空，提供一个默认回复
+            if not full_content:
+                full_content = "抱歉，我目前无法生成回复。请稍后再试。"
+
+            # 构建完整的非流式响应
+            openai_response = {
+                "id": openai_chunk_id,
+                "object": "chat.completion",
+                "created": openai_created_time,
+                "model": openai_model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": full_content
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": len(str(messages)) // 4,
+                    "completion_tokens": len(full_content) // 4,
+                    "total_tokens": (len(str(messages)) + len(full_content)) // 4
+                }
+            }
+            
+            # 将助手响应添加到会话历史
+            conversations[conversation_id].append({
+                "role": "assistant",
+                "content": full_content
+            })
+            
+            return openai_response
+            
+        except requests.exceptions.RequestException as e:
+            error_message = f"Grok API request failed: {e}"
+            print(error_message)
+            return {"error": {"message": error_message, "type": "api_error"}}
+    
+    # 流式响应处理函数
     def stream_grok_response():
         try:
             grok_response = session.post(
@@ -239,6 +332,54 @@ def openai_to_grok_proxy():
             openai_chunk_id = encode_chat_id(grok_id)
             openai_model = grok_request_body['grokModelOptionId']
 
+            # 如果是非流式请求，累积所有响应
+            if not stream_mode:
+                full_content = ""
+                for line in grok_response.iter_lines():
+                    if line:
+                        try:
+                            grok_data = json.loads(line.decode('utf-8'))
+                            if 'result' in grok_data and 'sender' in grok_data['result']:
+                                result = grok_data['result']
+                                if result['sender'] == 2:  # 2 represents assistant
+                                    message_content = convert_tweet_links(result.get('message', ''))
+                                    is_thinking = result.get('isThinking', False)
+                                    if not is_thinking:  # 只累积非思考内容
+                                        full_content += message_content
+                        except json.JSONDecodeError:
+                            print(f"Warning: Could not decode JSON: {line.decode('utf-8')}")
+                        except Exception as e:
+                            print(f"Error processing Grok response chunk: {e}")
+                
+                # 返回完整的非流式响应
+                openai_response = {
+                    "id": openai_chunk_id,
+                    "object": "chat.completion",
+                    "created": openai_created_time,
+                    "model": openai_model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": full_content
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": len(str(messages)) // 4,  # 简易估算
+                        "completion_tokens": len(full_content) // 4,
+                        "total_tokens": (len(str(messages)) + len(full_content)) // 4
+                    }
+                }
+                # 将助手响应添加到会话历史
+                conversations[conversation_id].append({
+                    "role": "assistant",
+                    "content": full_content
+                })
+                
+                return openai_response
+            
+            # 以下是原有的流式响应逻辑
             # 追踪是否已经发送了停止信号
             stop_signal_sent = False
 
@@ -249,7 +390,12 @@ def openai_to_grok_proxy():
                         if 'result' in grok_data:
                             result = grok_data['result']
                             if 'sender' in result:
+                                # 这里已经正确使用了SENDER_TO_ROLE映射，但为确保一致性，
+                                # 可能需要检查是否正确处理了"ASSISTANT"字符串
                                 role = SENDER_TO_ROLE.get(result['sender'], 'assistant')
+                                # 如果sender是字符串"ASSISTANT"，手动设置role为"assistant"
+                                if result['sender'] == "ASSISTANT":
+                                    role = "assistant"
                                 message_content = convert_tweet_links(result.get('message', ''))
 
                                 is_thinking = result.get('isThinking', False)  # Check for thinking status
@@ -330,20 +476,26 @@ def openai_to_grok_proxy():
             }
             yield f"data: {json.dumps(openai_error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
-
-
-    response = flask.Response(
-        flask.stream_with_context(stream_grok_response()), 
-        mimetype='text/event-stream'
-    )
     
-    # 添加必要的SSE响应头
-    response.headers['Cache-Control'] = 'no-cache'
-    response.headers['Connection'] = 'keep-alive'
-    response.headers['X-Accel-Buffering'] = 'no'
-    response.headers['Content-Type'] = 'text/event-stream'
-    
-    return response
+    # 调用处理函数
+    if not stream_mode:
+        # 非流式模式，直接返回完整响应
+        response_data = process_non_stream_response()
+        return flask.jsonify(response_data)
+    else:
+        # 流式模式，使用SSE
+        response = flask.Response(
+            flask.stream_with_context(stream_grok_response()), 
+            mimetype='text/event-stream'
+        )
+        
+        # 添加必要的SSE响应头
+        response.headers['Cache-Control'] = 'no-cache'
+        response.headers['Connection'] = 'keep-alive'
+        response.headers['X-Accel-Buffering'] = 'no'
+        response.headers['Content-Type'] = 'text/event-stream'
+        
+        return response
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
