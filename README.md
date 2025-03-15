@@ -2,6 +2,11 @@
 
 A janky proxy server that converts OpenAI API format requests to Grok API format.
 
+## Alternative Implementation
+
+For another implementation of Grok API, check out:
+[https://github.com/omgpizzatnt/grok-free-web-api-vercel](https://github.com/omgpizzatnt/grok-free-web-api-vercel)
+
 ## Authentication Setup
 
 1. Navigate to grok.x.com
